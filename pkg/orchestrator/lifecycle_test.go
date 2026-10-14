@@ -74,7 +74,7 @@ func (m *mockInjector) Inject(ctx context.Context, spec v1alpha1.InjectionSpec, 
 	return cleanup, events, nil
 }
 
-func newTestOrchestrator(obs *mockObserver, inj *mockInjector) *Orchestrator {
+func newTestOrchestrator(obs observer.Observer, inj *mockInjector) *Orchestrator {
 	registry := injection.NewRegistry()
 	registry.Register(v1alpha1.PodKill, inj)
 
@@ -1271,4 +1271,114 @@ func TestValidateExperimentErrorChainBlastRadius(t *testing.T) {
 	// Verify the wrapped error is accessible
 	unwrapped := err
 	assert.NotNil(t, unwrapped)
+}
+
+// timelineObserver records the wall time of every steady-state check so tests
+// can assert ordering between fault revert and post-check. The first call is
+// the pre-check; the last is the post-check.
+type timelineObserver struct {
+	calls []time.Time
+}
+
+func (o *timelineObserver) CheckSteadyState(_ context.Context, checks []v1alpha1.SteadyStateCheck, _ string) (*v1alpha1.CheckResult, error) {
+	o.calls = append(o.calls, time.Now())
+	return &v1alpha1.CheckResult{Passed: true, ChecksRun: int32(len(checks)), ChecksPassed: int32(len(checks)), Timestamp: metav1.Now()}, nil
+}
+
+func newTimelineExperiment(ttl, recovery time.Duration) *v1alpha1.ChaosExperiment {
+	exp := newTestExperiment()
+	if ttl > 0 {
+		exp.Spec.Injection.TTL = metav1.Duration{Duration: ttl}
+	}
+	exp.Spec.Hypothesis.RecoveryTimeout = metav1.Duration{Duration: recovery}
+	exp.Spec.SteadyState.Checks = []v1alpha1.SteadyStateCheck{
+		{Type: v1alpha1.CheckConditionTrue, APIVersion: "apps/v1", Kind: "Deployment", Name: "test-deploy", Namespace: "test-ns", ConditionType: "Available"},
+	}
+	return exp
+}
+
+// TestRunTTLBearingFaultRevertedBeforePostCheck verifies that a TTL-bearing
+// fault is reverted when the TTL elapses and the post-check only runs after a
+// full recovery timeout measured from the revert, not from injection.
+func TestRunTTLBearingFaultRevertedBeforePostCheck(t *testing.T) {
+	obs := &timelineObserver{}
+	inj := &mockInjector{}
+	var cleanedAt time.Time
+	inj.cleanupFunc = func(_ context.Context) error {
+		cleanedAt = time.Now()
+		return nil
+	}
+
+	orch := newTestOrchestrator(obs, inj)
+	exp := newTimelineExperiment(40*time.Millisecond, 120*time.Millisecond)
+	start := time.Now()
+
+	_, err := orch.Run(context.Background(), exp)
+	require.NoError(t, err)
+
+	require.Len(t, obs.calls, 2, "pre-check and post-check must both run")
+	postCheckAt := obs.calls[1]
+	require.False(t, cleanedAt.IsZero(), "fault must be reverted during the run")
+	assert.True(t, cleanedAt.Before(postCheckAt), "fault revert must happen before the post-check")
+	assert.GreaterOrEqual(t, postCheckAt.Sub(cleanedAt).Milliseconds(), int64(115),
+		"post-check must run a full recovery timeout after the revert")
+	assert.GreaterOrEqual(t, time.Since(start).Milliseconds(), int64(155),
+		"total run must cover TTL plus recovery window")
+}
+
+// TestRunNoTTLKeepsDeferredCleanup verifies that experiments without a TTL
+// keep the legacy timing: observe from injection, cleanup deferred to the end.
+func TestRunNoTTLKeepsDeferredCleanup(t *testing.T) {
+	obs := &timelineObserver{}
+	inj := &mockInjector{}
+	var cleanedAt time.Time
+	inj.cleanupFunc = func(_ context.Context) error {
+		cleanedAt = time.Now()
+		return nil
+	}
+
+	orch := newTestOrchestrator(obs, inj)
+	exp := newTimelineExperiment(0, 100*time.Millisecond)
+	start := time.Now()
+
+	_, err := orch.Run(context.Background(), exp)
+	require.NoError(t, err)
+
+	require.Len(t, obs.calls, 2)
+	postCheckAt := obs.calls[1]
+	require.False(t, cleanedAt.IsZero())
+	assert.True(t, cleanedAt.After(postCheckAt), "cleanup stays deferred to the end when no TTL is set")
+	assert.GreaterOrEqual(t, postCheckAt.Sub(start).Milliseconds(), int64(95),
+		"post-check must still wait the recovery timeout from injection")
+	assert.Less(t, postCheckAt.Sub(start).Milliseconds(), int64(400),
+		"no second recovery window for TTL-less experiments")
+}
+
+// TestRunTTLRevertRetriedOnError verifies that a failed mid-run revert is
+// retried and the recovery window is measured from the successful revert.
+func TestRunTTLRevertRetriedOnError(t *testing.T) {
+	obs := &timelineObserver{}
+	inj := &mockInjector{}
+	attempts := 0
+	var okAt time.Time
+	inj.cleanupFunc = func(_ context.Context) error {
+		attempts++
+		if attempts == 1 {
+			return fmt.Errorf("transient revert failure")
+		}
+		okAt = time.Now()
+		return nil
+	}
+
+	orch := newTestOrchestrator(obs, inj)
+	orch.revertRetryInterval = time.Millisecond
+	exp := newTimelineExperiment(20*time.Millisecond, 60*time.Millisecond)
+
+	_, err := orch.Run(context.Background(), exp)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, attempts, "failed revert must be retried")
+	require.Len(t, obs.calls, 2)
+	assert.GreaterOrEqual(t, obs.calls[1].Sub(okAt).Milliseconds(), int64(55),
+		"recovery window must be measured from the successful revert")
 }

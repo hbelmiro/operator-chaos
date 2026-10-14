@@ -30,6 +30,11 @@ const (
 	immediateRequeue      = 100 * time.Millisecond
 	lockContentionRequeue = 30 * time.Second
 	maxObserveRequeue     = 30 * time.Second
+	// revertRetryInterval spaces out retries of a failed fault revert so a
+	// persistently failing revert does not hammer the API server or spam
+	// events on every reconcile. Matches the CLI orchestrator's retry
+	// interval for the same situation.
+	revertRetryInterval = 5 * time.Second
 )
 
 
@@ -349,31 +354,57 @@ func (r *ChaosExperimentReconciler) reconcileInject(ctx context.Context, exp *v1
 	return ctrl.Result{RequeueAfter: immediateRequeue}, nil
 }
 
-// reconcileObserve waits for the recovery timeout to elapse, then reverts the
-// fault and transitions to SteadyStatePost.
+// reconcileObserve observes the fault until it is time to revert it, then
+// keeps observing for a full recovery window measured from the revert before
+// transitioning to SteadyStatePost. Measuring the window from the fault
+// removal (not from injection) gives persistent faults, e.g. NetworkPartition,
+// a real recoveryTimeout of observation with the fault gone.
 func (r *ChaosExperimentReconciler) reconcileObserve(ctx context.Context, exp *v1alpha1.ChaosExperiment, emitter *EventEmitter) (ctrl.Result, error) {
 	if exp.Status.InjectionStartedAt == nil {
 		return r.abort(ctx, exp, "InjectionStartedAt is nil in Observing phase", emitter)
 	}
 
-	elapsed := r.Clock.Now().Sub(exp.Status.InjectionStartedAt.Time)
+	now := r.Clock.Now()
+	elapsed := now.Sub(exp.Status.InjectionStartedAt.Time)
+	recoveryTimeout := exp.ResolvedRecoveryTimeout()
 
-	// TTL enforcement: if TTL is set and exceeded, force-revert immediately
-	// regardless of recovery timeout. This prevents injections from running
-	// longer than their declared TTL.
-	if exp.Spec.Injection.TTL.Duration > 0 && elapsed > exp.Spec.Injection.TTL.Duration {
-		log.FromContext(ctx).Info("injection TTL exceeded, force-reverting", "ttl", exp.Spec.Injection.TTL.Duration, "elapsed", elapsed)
-		emitter.TTLExceeded(exp.Spec.Injection.TTL.Duration.String(), elapsed.String())
-	} else {
-		recoveryTimeout := exp.ResolvedRecoveryTimeout()
-		if elapsed < recoveryTimeout {
-			remaining := recoveryTimeout - elapsed
+	// Fault already reverted: wait out the recovery window measured from the
+	// revert time. Re-entry (e.g. controller crash) must not revert again.
+	if exp.Status.FaultRevertedAt != nil {
+		windowElapsed := now.Sub(exp.Status.FaultRevertedAt.Time)
+		if windowElapsed < recoveryTimeout {
+			remaining := recoveryTimeout - windowElapsed
 			requeue := remaining
 			if requeue > maxObserveRequeue {
 				requeue = maxObserveRequeue
 			}
 			return ctrl.Result{RequeueAfter: requeue}, nil
 		}
+
+		exp.Status.Phase = v1alpha1.PhaseSteadyStatePost
+		if err := r.Status().Update(ctx, exp); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: immediateRequeue}, nil
+	}
+
+	// Time to revert? Either the TTL has expired (force-revert, preventing
+	// injections from running longer than their declared TTL) or, when no TTL
+	// is set, the recovery timeout has elapsed.
+	ttl := exp.Spec.Injection.TTL.Duration
+	shouldRevert := (ttl > 0 && elapsed > ttl) || elapsed >= recoveryTimeout
+	if !shouldRevert {
+		remaining := recoveryTimeout - elapsed
+		requeue := remaining
+		if requeue > maxObserveRequeue {
+			requeue = maxObserveRequeue
+		}
+		return ctrl.Result{RequeueAfter: requeue}, nil
+	}
+
+	if ttl > 0 && elapsed > ttl {
+		log.FromContext(ctx).Info("injection TTL exceeded, force-reverting", "ttl", ttl, "elapsed", elapsed)
+		emitter.TTLExceeded(ttl.String(), elapsed.String())
 	}
 
 	// Verify lease is still held before reverting — if the lease expired and
@@ -387,23 +418,32 @@ func (r *ChaosExperimentReconciler) reconcileObserve(ctx context.Context, exp *v
 		return r.abort(ctx, exp, fmt.Sprintf("pre-revert lease check failed: %v", err), emitter)
 	}
 
-	// Recovery timeout elapsed — revert the fault.
+	// Revert the fault.
 	// NOTE: RevertFault implementations MUST be idempotent. If the controller
 	// crashes after RevertFault succeeds but before the status update below,
 	// RevertFault will run again on re-entry. This is safe because revert
 	// restores from rollback data, which is a no-op if already restored.
+	// A failed revert is retried on the next reconcile rather than aborting,
+	// so a transient error does not leave the fault active with no owner.
 	if err := r.Orchestrator.RevertFault(ctx, exp); err != nil {
 		emitter.RevertFailed(err)
-		return r.abort(ctx, exp, fmt.Sprintf("post-timeout revert failed: %v", err), emitter)
+		return ctrl.Result{RequeueAfter: revertRetryInterval}, nil
 	}
 
-	exp.Status.Phase = v1alpha1.PhaseSteadyStatePost
+	revertTime := r.Clock.Now()
+	exp.Status.FaultRevertedAt = &metav1.Time{Time: revertTime}
 	emitter.FaultReverted()
 
 	if err := r.Status().Update(ctx, exp); err != nil {
 		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: immediateRequeue}, nil
+
+	// Full recovery window remains, measured from the revert.
+	requeue := recoveryTimeout
+	if requeue > maxObserveRequeue {
+		requeue = maxObserveRequeue
+	}
+	return ctrl.Result{RequeueAfter: requeue}, nil
 }
 
 // reconcilePostCheck runs the post-check, stores results, and evaluates the

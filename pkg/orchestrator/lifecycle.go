@@ -43,6 +43,10 @@ type Orchestrator struct {
 	verbose   bool
 	logger    *slog.Logger
 	depGraph  *model.DependencyGraph
+
+	// revertRetryInterval is the delay between attempts to revert a
+	// TTL-bearing fault mid-run after a failed revert. Overridden in tests.
+	revertRetryInterval time.Duration
 }
 
 // OrchestratorConfig holds configuration for creating an Orchestrator.
@@ -84,17 +88,18 @@ func New(config OrchestratorConfig) *Orchestrator {
 	}
 
 	return &Orchestrator{
-		registry:   config.Registry,
-		observer:   config.Observer,
-		reconciler: config.Reconciler,
-		evaluator:  config.Evaluator,
-		lock:       config.Lock,
-		knowledge:  config.Knowledge,
-		k8sClient:  config.K8sClient,
-		reportDir:  config.ReportDir,
-		verbose:    config.Verbose,
-		logger:     logger,
-		depGraph:   config.DepGraph,
+		registry:            config.Registry,
+		observer:            config.Observer,
+		reconciler:          config.Reconciler,
+		evaluator:           config.Evaluator,
+		lock:                config.Lock,
+		knowledge:           config.Knowledge,
+		k8sClient:           config.K8sClient,
+		reportDir:           config.ReportDir,
+		verbose:             config.Verbose,
+		logger:              logger,
+		depGraph:            config.DepGraph,
+		revertRetryInterval: 5 * time.Second,
 	}
 }
 
@@ -531,20 +536,72 @@ func (o *Orchestrator) Run(ctx context.Context, exp *v1alpha1.ChaosExperiment) (
 
 	o.logger.Info("injection complete", "events", len(events))
 
-	// 4. Observe — wait for recovery timeout before post-check.
+	// 4. Observe — wait for the fault to be removed, then observe a full
+	// recovery window before the post-check.
 	o.logger.Info("phase transition", "phase", "OBSERVING", "action", "waiting for recovery")
 	result.Phase = v1alpha1.PhaseObserving
 
-	o.logger.Info("OBSERVING", "recoveryTimeout", recoveryTimeout)
-	select {
-	case <-time.After(recoveryTimeout):
-	case <-ctx.Done():
-		// Context cancelled during observation — abort cleanly rather than
-		// passing a dead context to RunPostCheck which would produce confusing errors.
-		o.logger.Warn("context cancelled during observation, aborting experiment")
-		result.Phase = v1alpha1.PhaseAborted
-		result.Error = "experiment interrupted: context cancelled during observation"
-		return result, ctx.Err()
+	ttl := exp.Spec.Injection.TTL.Duration
+	if ttl > 0 {
+		// TTL-bearing fault: the recovery window must be measured from the
+		// fault removal, not from injection, so the experiment observes a
+		// full recoveryTimeout with the fault actually gone.
+		o.logger.Info("OBSERVING", "ttl", ttl, "recoveryTimeout", recoveryTimeout)
+
+		select {
+		case <-time.After(ttl):
+		case <-ctx.Done():
+			o.logger.Warn("context cancelled during observation, aborting experiment")
+			result.Phase = v1alpha1.PhaseAborted
+			result.Error = "experiment interrupted: context cancelled during observation"
+			return result, ctx.Err()
+		}
+
+		// Revert the fault at TTL expiry, retrying transient failures so the
+		// fault is not left active with no attempt to remove it.
+		for cleanup != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(ctx, defaultCleanupTimeout)
+			cleanErr := cleanup(cleanupCtx)
+			cleanupCancel()
+			if cleanErr == nil {
+				// Consumed: the deferred cleanup must not run a second time.
+				cleanup = nil
+				break
+			}
+			o.logger.Warn("fault revert failed, retrying", "error", cleanErr, "retryInterval", o.revertRetryInterval)
+			select {
+			case <-time.After(o.revertRetryInterval):
+			case <-ctx.Done():
+				o.logger.Warn("context cancelled while retrying fault revert, aborting experiment")
+				result.Phase = v1alpha1.PhaseAborted
+				result.Error = "experiment interrupted: context cancelled during fault revert"
+				return result, ctx.Err()
+			}
+		}
+		o.logger.Info("fault reverted at TTL, observing recovery window", "recoveryTimeout", recoveryTimeout)
+
+		select {
+		case <-time.After(recoveryTimeout):
+		case <-ctx.Done():
+			o.logger.Warn("context cancelled during recovery window, aborting experiment")
+			result.Phase = v1alpha1.PhaseAborted
+			result.Error = "experiment interrupted: context cancelled during observation"
+			return result, ctx.Err()
+		}
+	} else {
+		// No TTL: legacy timing — observe from injection, cleanup stays
+		// deferred to the end of the run.
+		o.logger.Info("OBSERVING", "recoveryTimeout", recoveryTimeout)
+		select {
+		case <-time.After(recoveryTimeout):
+		case <-ctx.Done():
+			// Context cancelled during observation — abort cleanly rather than
+			// passing a dead context to RunPostCheck which would produce confusing errors.
+			o.logger.Warn("context cancelled during observation, aborting experiment")
+			result.Phase = v1alpha1.PhaseAborted
+			result.Error = "experiment interrupted: context cancelled during observation"
+			return result, ctx.Err()
+		}
 	}
 
 	// 5. Steady State Post-Check
