@@ -47,9 +47,13 @@ func TestValidateRunDuration_NoTTLUsesRecoveryTimeout(t *testing.T) {
 	assert.Contains(t, err.Error(), "15m0s")
 }
 
-// TestValidateRunDuration_ExactFitPasses pins the strict-inequality boundary:
-// a run duration exactly equal to the timeout is accepted.
-func TestValidateRunDuration_ExactFitPasses(t *testing.T) {
+// TestValidateRunDuration_ExactFitRejected pins the boundary: a run duration
+// exactly equal to the timeout is rejected, because setup (validation, lock,
+// pre-check, injection) and the post-check all run inside the same timeout
+// context — an exact fit cannot finish.
+func TestValidateRunDuration_ExactFitRejected(t *testing.T) {
 	exp := newDurationTestExperiment(2*time.Minute, 3*time.Minute)
-	assert.NoError(t, validateRunDuration(exp, 5*time.Minute))
+	err := validateRunDuration(exp, 5*time.Minute)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds --timeout")
 }

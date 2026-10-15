@@ -477,9 +477,11 @@ func TestReconcileObserveTTLRevertsAtTTLAndWaitsWindowFromRevert(t *testing.T) {
 	assert.Equal(t, 1, orch.revertCallCount)
 }
 
-// TestReconcileObserveTTLExceedsRecoveryTimeout verifies that when the TTL is
-// later than the recovery timeout, the fault is reverted at the recovery
-// timeout (legacy timing) and the window still runs from the revert.
+// TestReconcileObserveTTLExceedsRecoveryTimeout verifies that the TTL is
+// authoritative: when the TTL is later than the recovery timeout, the fault
+// stays active for the full TTL (matching the CLI orchestrator and the
+// InjectionSpec.TTL documentation) and the recovery window still runs from
+// the revert.
 func TestReconcileObserveTTLExceedsRecoveryTimeout(t *testing.T) {
 	scheme := newTestScheme()
 	exp := newTestExperiment()
@@ -493,15 +495,31 @@ func TestReconcileObserveTTLExceedsRecoveryTimeout(t *testing.T) {
 	orch := &mockOrchestrator{}
 	lock := &mockLock{}
 	// 61s elapsed: past the 60s recovery timeout, before the 120s TTL.
+	// The fault must NOT be reverted yet — the TTL is authoritative.
 	clk := clock.NewFakeClock(startTime.Add(61 * time.Second))
 
 	r := newReconciler(scheme, exp, orch, lock, clk)
 	ctx := context.Background()
 
-	_, err := r.Reconcile(ctx, reconcileRequest())
+	result, err := r.Reconcile(ctx, reconcileRequest())
 	require.NoError(t, err)
 
 	updated, err := getExperiment(ctx, r)
+	require.NoError(t, err)
+	assert.Equal(t, v1alpha1.PhaseObserving, updated.Status.Phase)
+	assert.False(t, orch.revertCalled, "fault must stay active until the TTL elapses")
+	assert.Nil(t, updated.Status.FaultRevertedAt)
+	// Requeue aims at the TTL deadline: 59s remain, capped at maxObserveRequeue.
+	assert.Equal(t, maxObserveRequeue, result.RequeueAfter)
+
+	// Wake past the TTL: revert, then wait out the window from the revert.
+	clk = clock.NewFakeClock(startTime.Add(121 * time.Second))
+	r.Clock = clk
+
+	_, err = r.Reconcile(ctx, reconcileRequest())
+	require.NoError(t, err)
+
+	updated, err = getExperiment(ctx, r)
 	require.NoError(t, err)
 	assert.Equal(t, v1alpha1.PhaseObserving, updated.Status.Phase)
 	assert.True(t, orch.revertCalled)
@@ -2044,8 +2062,8 @@ func TestReconcileAbortedBackfillsEmptyMessageAndEndTime(t *testing.T) {
 	exp := newTestExperiment()
 	exp.Status.Phase = v1alpha1.PhaseAborted
 	exp.Status.ObservedGeneration = 1
-	exp.Status.Message = ""    // empty — should be backfilled
-	exp.Status.EndTime = nil   // nil — should be backfilled
+	exp.Status.Message = ""  // empty — should be backfilled
+	exp.Status.EndTime = nil // nil — should be backfilled
 	exp.Finalizers = []string{cleanupFinalizer}
 
 	orch := &mockOrchestrator{}

@@ -179,12 +179,15 @@ func overrideExperimentNamespace(exp *v1alpha1.ChaosExperiment, namespace string
 // validateRunDuration rejects experiments whose total duration cannot fit in
 // the run timeout. A TTL-bearing experiment runs for its TTL (fault active)
 // plus the recoveryTimeout recovery window measured from the fault removal;
-// experiments without a TTL run for their recoveryTimeout. Failing upfront
-// beats aborting mid-run and losing the verdict.
+// experiments without a TTL run for their recoveryTimeout. An exact fit is
+// also rejected: validation, locking, pre-check, injection, and the
+// post-check all run inside the same timeout context, so a run whose timers
+// alone consume the whole budget cannot finish. Failing upfront beats
+// aborting mid-run and losing the verdict.
 func validateRunDuration(exp *v1alpha1.ChaosExperiment, timeout time.Duration) error {
 	ttl := exp.Spec.Injection.TTL.Duration
 	recoveryTimeout := exp.ResolvedRecoveryTimeout()
-	if runDuration := ttl + recoveryTimeout; runDuration > timeout {
+	if runDuration := ttl + recoveryTimeout; runDuration >= timeout {
 		return fmt.Errorf("experiment duration %s (TTL %s + recoveryTimeout %s) exceeds --timeout %s; raise --timeout or shorten the experiment",
 			runDuration, ttl, recoveryTimeout, timeout)
 	}

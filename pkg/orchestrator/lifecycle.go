@@ -508,8 +508,16 @@ func (o *Orchestrator) Run(ctx context.Context, exp *v1alpha1.ChaosExperiment) (
 	// Compute recovery timeout early — needed for lease duration calculation.
 	recoveryTimeout := exp.ResolvedRecoveryTimeout()
 
-	// Acquire experiment lock with 2x recovery timeout, matching controller behavior.
+	// Acquire experiment lock covering the whole run. The lease must include
+	// the TTL: a TTL-bearing fault stays active for its TTL before the
+	// recovery window even starts, and the lease is not renewed during the
+	// run — a lease of only 2x recoveryTimeout would expire mid-run when the
+	// TTL outlasts it, letting another experiment lock the same operator
+	// while this fault is still active.
 	leaseDuration := recoveryTimeout * 2
+	if ttl := exp.Spec.Injection.TTL.Duration; ttl > 0 {
+		leaseDuration = ttl + recoveryTimeout*2
+	}
 	if err := o.lock.Acquire(ctx, exp.Spec.Target.Operator, exp.Name, leaseDuration); err != nil {
 		result.Error = fmt.Sprintf("lock acquisition failed: %v", err)
 		result.Phase = v1alpha1.PhaseAborted

@@ -13,8 +13,8 @@ import (
 	"github.com/opendatahub-io/operator-chaos/pkg/observer"
 	"github.com/opendatahub-io/operator-chaos/pkg/orchestrator"
 	"github.com/opendatahub-io/operator-chaos/pkg/safety"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -36,7 +36,6 @@ const (
 	// interval for the same situation.
 	revertRetryInterval = 5 * time.Second
 )
-
 
 // Compile-time interface check: *orchestrator.Orchestrator implements PhaseOrchestrator.
 var _ PhaseOrchestrator = (*orchestrator.Orchestrator)(nil)
@@ -60,18 +59,18 @@ type PhaseOrchestrator interface {
 // using deny-lists for system-critical resources. Cluster admins should review
 // ChaosExperiment CRs before approval.
 //
-//+kubebuilder:rbac:groups=chaos.operatorchaos.io,resources=chaosexperiments,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=chaos.operatorchaos.io,resources=chaosexperiments/status,verbs=get;update;patch
-//+kubebuilder:rbac:groups=chaos.operatorchaos.io,resources=chaosexperiments/finalizers,verbs=update
-//+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch;update
-//+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;delete
-//+kubebuilder:rbac:groups="",resources=configmaps;secrets,verbs=get;list;create;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=namespaces;serviceaccounts,verbs=get;list
-//+kubebuilder:rbac:groups=apps,resources=deployments;replicasets;statefulsets,verbs=get;list;watch;update;patch
-//+kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;create;delete
-//+kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;update;patch
-//+kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations;mutatingwebhookconfigurations,verbs=get;list;update;patch
+// +kubebuilder:rbac:groups=chaos.operatorchaos.io,resources=chaosexperiments,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=chaos.operatorchaos.io,resources=chaosexperiments/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=chaos.operatorchaos.io,resources=chaosexperiments/finalizers,verbs=update
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;update
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;delete
+// +kubebuilder:rbac:groups="",resources=configmaps;secrets,verbs=get;list;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=namespaces;serviceaccounts,verbs=get;list
+// +kubebuilder:rbac:groups=apps,resources=deployments;replicasets;statefulsets,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;create;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings;roles;rolebindings,verbs=get;list;update;patch
+// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations;mutatingwebhookconfigurations,verbs=get;list;update;patch
 type ChaosExperimentReconciler struct {
 	client.Client
 	Scheme       *runtime.Scheme
@@ -388,13 +387,18 @@ func (r *ChaosExperimentReconciler) reconcileObserve(ctx context.Context, exp *v
 		return ctrl.Result{RequeueAfter: immediateRequeue}, nil
 	}
 
-	// Time to revert? Either the TTL has expired (force-revert, preventing
-	// injections from running longer than their declared TTL) or, when no TTL
-	// is set, the recovery timeout has elapsed.
+	// Time to revert? The TTL is authoritative: when set, the fault stays
+	// active for its full declared TTL (matching the CLI orchestrator and
+	// the InjectionSpec.TTL documentation); the recovery timeout gates the
+	// revert only when no TTL is set.
 	ttl := exp.Spec.Injection.TTL.Duration
-	shouldRevert := (ttl > 0 && elapsed > ttl) || elapsed >= recoveryTimeout
+	deadline := recoveryTimeout
+	if ttl > 0 {
+		deadline = ttl
+	}
+	shouldRevert := elapsed >= deadline
 	if !shouldRevert {
-		remaining := recoveryTimeout - elapsed
+		remaining := deadline - elapsed
 		requeue := remaining
 		if requeue > maxObserveRequeue {
 			requeue = maxObserveRequeue
@@ -402,8 +406,8 @@ func (r *ChaosExperimentReconciler) reconcileObserve(ctx context.Context, exp *v
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
-	if ttl > 0 && elapsed > ttl {
-		log.FromContext(ctx).Info("injection TTL exceeded, force-reverting", "ttl", ttl, "elapsed", elapsed)
+	if ttl > 0 {
+		log.FromContext(ctx).Info("injection TTL elapsed, reverting", "ttl", ttl, "elapsed", elapsed)
 		emitter.TTLExceeded(ttl.String(), elapsed.String())
 	}
 
@@ -423,8 +427,13 @@ func (r *ChaosExperimentReconciler) reconcileObserve(ctx context.Context, exp *v
 	// crashes after RevertFault succeeds but before the status update below,
 	// RevertFault will run again on re-entry. This is safe because revert
 	// restores from rollback data, which is a no-op if already restored.
-	// A failed revert is retried on the next reconcile rather than aborting,
-	// so a transient error does not leave the fault active with no owner.
+	// A failed revert is retried on the next reconcile rather than aborting:
+	// the retry loop is intentionally unbounded, and it keeps renewing the
+	// experiment lock (renewed per reconcile in Reconcile()), so the fault
+	// stays owned — no other experiment can lock this operator while cleanup
+	// is pending. Aborting instead would release the lock with the fault
+	// still active. Revisit if a bounded retry with lock retention on
+	// cleanup failure is ever needed.
 	if err := r.Orchestrator.RevertFault(ctx, exp); err != nil {
 		emitter.RevertFailed(err)
 		return ctrl.Result{RequeueAfter: revertRetryInterval}, nil

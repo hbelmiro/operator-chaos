@@ -369,8 +369,8 @@ func TestOrchestratorCleanupUsesBackgroundContext(t *testing.T) {
 	// return a cleanup function that records whether its context is valid.
 	registry := injection.NewRegistry()
 	customInj := &contextCancellingMockInjector{
-		cancelParent: cancel,
-		cleanupDone:  cleanupDone,
+		cancelParent:  cancel,
+		cleanupDone:   cleanupDone,
 		cleanupCtxErr: &cleanupCtxErr,
 	}
 	registry.Register(v1alpha1.PodKill, customInj)
@@ -1381,4 +1381,57 @@ func TestRunTTLRevertRetriedOnError(t *testing.T) {
 	require.Len(t, obs.calls, 2)
 	assert.GreaterOrEqual(t, obs.calls[1].Sub(okAt).Milliseconds(), int64(55),
 		"recovery window must be measured from the successful revert")
+}
+
+// durationRecordingLock records the lease duration passed to Acquire.
+type durationRecordingLock struct {
+	safety.ExperimentLock
+	acquiredWith time.Duration
+}
+
+func (d *durationRecordingLock) Acquire(_ context.Context, _ string, _ string, leaseDuration time.Duration) error {
+	d.acquiredWith = leaseDuration
+	return nil
+}
+
+// TestRunLeaseDurationIncludesTTL verifies the distributed lock lease covers
+// the whole run: TTL plus twice the recovery timeout for TTL-bearing faults,
+// instead of just twice the recovery timeout, which expires mid-run when the
+// TTL outlasts it.
+func TestRunLeaseDurationIncludesTTL(t *testing.T) {
+	obs := &timelineObserver{}
+	inj := &mockInjector{}
+	lock := &durationRecordingLock{ExperimentLock: safety.NewLocalExperimentLock()}
+
+	registry := injection.NewRegistry()
+	registry.Register(v1alpha1.PodKill, inj)
+	orch := New(OrchestratorConfig{
+		Registry:  registry,
+		Observer:  obs,
+		Evaluator: evaluator.New(10),
+		Lock:      lock,
+		Verbose:   false,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	exp := newTimelineExperiment(20*time.Millisecond, 60*time.Millisecond)
+	_, err := orch.Run(context.Background(), exp)
+	require.NoError(t, err)
+	assert.Equal(t, 20*time.Millisecond+2*60*time.Millisecond, lock.acquiredWith,
+		"lease must cover TTL plus the recovery-time allowance")
+
+	// Without a TTL the lease keeps the legacy duration.
+	lock2 := &durationRecordingLock{ExperimentLock: safety.NewLocalExperimentLock()}
+	orch2 := New(OrchestratorConfig{
+		Registry:  registry,
+		Observer:  &timelineObserver{},
+		Evaluator: evaluator.New(10),
+		Lock:      lock2,
+		Verbose:   false,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	exp2 := newTimelineExperiment(0, 60*time.Millisecond)
+	_, err = orch2.Run(context.Background(), exp2)
+	require.NoError(t, err)
+	assert.Equal(t, 2*60*time.Millisecond, lock2.acquiredWith)
 }
