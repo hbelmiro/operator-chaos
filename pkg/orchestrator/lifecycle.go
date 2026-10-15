@@ -39,10 +39,10 @@ type Orchestrator struct {
 	lock       safety.ExperimentLock
 	knowledge  *model.OperatorKnowledge
 	k8sClient  client.Client
-	reportDir string
-	verbose   bool
-	logger    *slog.Logger
-	depGraph  *model.DependencyGraph
+	reportDir  string
+	verbose    bool
+	logger     *slog.Logger
+	depGraph   *model.DependencyGraph
 
 	// revertRetryInterval is the delay between attempts to revert a
 	// TTL-bearing fault mid-run after a failed revert. Overridden in tests.
@@ -59,18 +59,18 @@ type OrchestratorConfig struct {
 	Knowledge  *model.OperatorKnowledge
 	K8sClient  client.Client
 	ReportDir  string
-	Verbose  bool
-	DepGraph *model.DependencyGraph
-	Logger   *slog.Logger
+	Verbose    bool
+	DepGraph   *model.DependencyGraph
+	Logger     *slog.Logger
 }
 
 // ExperimentResult captures the outcome of running a chaos experiment.
 type ExperimentResult struct {
-	Experiment string                      `json:"experiment"`
-	Phase      v1alpha1.ExperimentPhase    `json:"phase"`
-	Verdict    v1alpha1.Verdict            `json:"verdict,omitempty"`
-	Evaluation *evaluator.EvaluationResult `json:"evaluation,omitempty"`
-	Report     *reporter.ExperimentReport  `json:"report,omitempty"`
+	Experiment   string                      `json:"experiment"`
+	Phase        v1alpha1.ExperimentPhase    `json:"phase"`
+	Verdict      v1alpha1.Verdict            `json:"verdict,omitempty"`
+	Evaluation   *evaluator.EvaluationResult `json:"evaluation,omitempty"`
+	Report       *reporter.ExperimentReport  `json:"report,omitempty"`
 	Error        string                      `json:"error,omitempty"`
 	CleanupError string                      `json:"cleanupError,omitempty"`
 	Tier         int32                       `json:"tier,omitempty"`
@@ -108,6 +108,7 @@ func New(config OrchestratorConfig) *Orchestrator {
 //  2. single allowedNamespaces entry (unambiguous intent)
 //  3. first steady-state check namespace (common in single-namespace experiments)
 //  4. DefaultNamespace fallback
+//
 // resolveNamespace determines the target namespace for injection.
 // Priority: spec-level hints (allowedNamespaces, steady-state check namespace)
 // take precedence over the CR's metadata namespace, because in controller mode
@@ -163,29 +164,29 @@ func isClusterScopedInjection(injectionType v1alpha1.InjectionType, params map[s
 
 // clusterScopedKinds lists Kubernetes resource kinds that are cluster-scoped.
 var clusterScopedKinds = map[string]bool{
-	"Namespace":                           true,
-	"Node":                                true,
-	"ClusterRole":                         true,
-	"ClusterRoleBinding":                  true,
-	"CustomResourceDefinition":            true,
-	"PersistentVolume":                    true,
-	"StorageClass":                        true,
-	"IngressClass":                        true,
-	"PriorityClass":                       true,
-	"ValidatingWebhookConfiguration":      true,
-	"MutatingWebhookConfiguration":        true,
-	"APIService":                          true,
+	"Namespace":                      true,
+	"Node":                           true,
+	"ClusterRole":                    true,
+	"ClusterRoleBinding":             true,
+	"CustomResourceDefinition":       true,
+	"PersistentVolume":               true,
+	"StorageClass":                   true,
+	"IngressClass":                   true,
+	"PriorityClass":                  true,
+	"ValidatingWebhookConfiguration": true,
+	"MutatingWebhookConfiguration":   true,
+	"APIService":                     true,
 	// Kueue cluster-scoped resources
-	"Kueue":                               true,
-	"ClusterQueue":                        true,
-	"ResourceFlavor":                      true,
-	"WorkloadPriorityClass":               true,
-	"Cohort":                              true,
-	"AdmissionCheck":                      true,
-	"MultiKueueCluster":                   true,
-	"MultiKueueConfig":                    true,
-	"ProvisioningRequestConfig":           true,
-	"Topology":                            true,
+	"Kueue":                     true,
+	"ClusterQueue":              true,
+	"ResourceFlavor":            true,
+	"WorkloadPriorityClass":     true,
+	"Cohort":                    true,
+	"AdmissionCheck":            true,
+	"MultiKueueCluster":         true,
+	"MultiKueueConfig":          true,
+	"ProvisioningRequestConfig": true,
+	"Topology":                  true,
 }
 
 // forbiddenNamespaces is the set of namespaces that must never be targeted by
@@ -328,6 +329,39 @@ func (o *Orchestrator) ValidateExperiment(ctx context.Context, exp *v1alpha1.Cha
 	}
 
 	return nil
+}
+
+// revertAtTTL waits for the TTL to elapse, then reverts the fault by
+// consuming the cleanup function, retrying transient failures so the fault
+// is not left active with no attempt to remove it. On success it returns a
+// nil cleanup; if the context is cancelled first it returns the cleanup
+// unchanged (still owned by the caller's deferred cleanup) along with the
+// context error.
+func (o *Orchestrator) revertAtTTL(ctx context.Context, cleanup injection.CleanupFunc, ttl time.Duration) (injection.CleanupFunc, error) {
+	select {
+	case <-time.After(ttl):
+	case <-ctx.Done():
+		o.logger.Warn("context cancelled during observation, aborting experiment")
+		return cleanup, ctx.Err()
+	}
+
+	for cleanup != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(ctx, defaultCleanupTimeout)
+		cleanErr := cleanup(cleanupCtx)
+		cleanupCancel()
+		if cleanErr == nil {
+			// Consumed: the deferred cleanup must not run a second time.
+			return nil, nil
+		}
+		o.logger.Warn("fault revert failed, retrying", "error", cleanErr, "retryInterval", o.revertRetryInterval)
+		select {
+		case <-time.After(o.revertRetryInterval):
+		case <-ctx.Done():
+			o.logger.Warn("context cancelled while retrying fault revert, aborting experiment")
+			return cleanup, ctx.Err()
+		}
+	}
+	return nil, nil
 }
 
 // RunPreCheck executes the steady-state pre-check. If no checks are defined it
@@ -548,35 +582,12 @@ func (o *Orchestrator) Run(ctx context.Context, exp *v1alpha1.ChaosExperiment) (
 		// full recoveryTimeout with the fault actually gone.
 		o.logger.Info("OBSERVING", "ttl", ttl, "recoveryTimeout", recoveryTimeout)
 
-		select {
-		case <-time.After(ttl):
-		case <-ctx.Done():
-			o.logger.Warn("context cancelled during observation, aborting experiment")
+		var revertErr error
+		cleanup, revertErr = o.revertAtTTL(ctx, cleanup, ttl)
+		if revertErr != nil {
 			result.Phase = v1alpha1.PhaseAborted
 			result.Error = "experiment interrupted: context cancelled during observation"
-			return result, ctx.Err()
-		}
-
-		// Revert the fault at TTL expiry, retrying transient failures so the
-		// fault is not left active with no attempt to remove it.
-		for cleanup != nil {
-			cleanupCtx, cleanupCancel := context.WithTimeout(ctx, defaultCleanupTimeout)
-			cleanErr := cleanup(cleanupCtx)
-			cleanupCancel()
-			if cleanErr == nil {
-				// Consumed: the deferred cleanup must not run a second time.
-				cleanup = nil
-				break
-			}
-			o.logger.Warn("fault revert failed, retrying", "error", cleanErr, "retryInterval", o.revertRetryInterval)
-			select {
-			case <-time.After(o.revertRetryInterval):
-			case <-ctx.Done():
-				o.logger.Warn("context cancelled while retrying fault revert, aborting experiment")
-				result.Phase = v1alpha1.PhaseAborted
-				result.Error = "experiment interrupted: context cancelled during fault revert"
-				return result, ctx.Err()
-			}
+			return result, revertErr
 		}
 		o.logger.Info("fault reverted at TTL, observing recovery window", "recoveryTimeout", recoveryTimeout)
 
@@ -760,7 +771,7 @@ func (o *Orchestrator) storeResultConfigMap(ctx context.Context, exp *v1alpha1.C
 	cmName = strings.TrimRight(cmName, "-._")
 
 	cmLabels := map[string]string{
-		"app.kubernetes.io/managed-by":    "operator-chaos",
+		"app.kubernetes.io/managed-by":      "operator-chaos",
 		"chaos.operatorchaos.io/experiment": truncateLabel(exp.Name),
 		"chaos.operatorchaos.io/verdict":    strings.ToLower(string(report.Evaluation.Verdict)),
 	}
@@ -786,4 +797,3 @@ func (o *Orchestrator) storeResultConfigMap(ctx context.Context, exp *v1alpha1.C
 		o.logger.Info("result ConfigMap stored", "name", cmName, "namespace", namespace, "operation", result)
 	}
 }
-

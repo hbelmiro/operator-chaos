@@ -69,6 +69,14 @@ func newRunCommand() *cobra.Command {
 				return fmt.Errorf("%d validation errors", len(errs))
 			}
 
+			// A TTL-bearing experiment runs for TTL (fault active) plus
+			// recoveryTimeout (recovery window measured from the revert).
+			// Reject upfront when that cannot fit in the run timeout, instead
+			// of aborting mid-window and losing the verdict.
+			if err := validateRunDuration(exp, timeout); err != nil {
+				return err
+			}
+
 			// Override namespace only when explicitly set by the user.
 			// The persistent --namespace flag has a default value, so
 			// checking for non-empty would always override per-check
@@ -166,4 +174,19 @@ func overrideExperimentNamespace(exp *v1alpha1.ChaosExperiment, namespace string
 		}
 		exp.Spec.BlastRadius.AllowedNamespaces = updated
 	}
+}
+
+// validateRunDuration rejects experiments whose total duration cannot fit in
+// the run timeout. A TTL-bearing experiment runs for its TTL (fault active)
+// plus the recoveryTimeout recovery window measured from the fault removal;
+// experiments without a TTL run for their recoveryTimeout. Failing upfront
+// beats aborting mid-run and losing the verdict.
+func validateRunDuration(exp *v1alpha1.ChaosExperiment, timeout time.Duration) error {
+	ttl := exp.Spec.Injection.TTL.Duration
+	recoveryTimeout := exp.ResolvedRecoveryTimeout()
+	if runDuration := ttl + recoveryTimeout; runDuration > timeout {
+		return fmt.Errorf("experiment duration %s (TTL %s + recoveryTimeout %s) exceeds --timeout %s; raise --timeout or shorten the experiment",
+			runDuration, ttl, recoveryTimeout, timeout)
+	}
+	return nil
 }
