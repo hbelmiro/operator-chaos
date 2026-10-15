@@ -333,11 +333,14 @@ func (o *Orchestrator) ValidateExperiment(ctx context.Context, exp *v1alpha1.Cha
 
 // revertAtTTL waits for the TTL to elapse, then reverts the fault by
 // consuming the cleanup function, retrying transient failures so the fault
-// is not left active with no attempt to remove it. On success it returns a
-// nil cleanup; if the context is cancelled first it returns the cleanup
-// unchanged (still owned by the caller's deferred cleanup) along with the
-// context error.
-func (o *Orchestrator) revertAtTTL(ctx context.Context, cleanup injection.CleanupFunc, ttl time.Duration) (injection.CleanupFunc, error) {
+// is not left active with no attempt to remove it. The lease is renewed
+// before each retry: the retry loop can outlast the fixed lease duration,
+// and without renewal another experiment could acquire the same operator
+// lock while this fault is still active. On success it returns a nil
+// cleanup; if the context is cancelled or the lease is lost it returns the
+// cleanup unchanged (still owned by the caller's deferred cleanup) along
+// with the error.
+func (o *Orchestrator) revertAtTTL(ctx context.Context, exp *v1alpha1.ChaosExperiment, cleanup injection.CleanupFunc, ttl time.Duration) (injection.CleanupFunc, error) {
 	select {
 	case <-time.After(ttl):
 	case <-ctx.Done():
@@ -354,6 +357,12 @@ func (o *Orchestrator) revertAtTTL(ctx context.Context, cleanup injection.Cleanu
 			return nil, nil
 		}
 		o.logger.Warn("fault revert failed, retrying", "error", cleanErr, "retryInterval", o.revertRetryInterval)
+		// The retry loop can outlast the lease acquired at the start of the
+		// run — renew it so the fault stays owned while cleanup is pending.
+		if err := o.lock.Renew(ctx, exp.Spec.Target.Operator, exp.Name); err != nil {
+			o.logger.Warn("experiment lock renewal failed during fault revert, aborting", "error", err)
+			return cleanup, fmt.Errorf("lock renewal during fault revert: %w", err)
+		}
 		select {
 		case <-time.After(o.revertRetryInterval):
 		case <-ctx.Done():
@@ -591,10 +600,10 @@ func (o *Orchestrator) Run(ctx context.Context, exp *v1alpha1.ChaosExperiment) (
 		o.logger.Info("OBSERVING", "ttl", ttl, "recoveryTimeout", recoveryTimeout)
 
 		var revertErr error
-		cleanup, revertErr = o.revertAtTTL(ctx, cleanup, ttl)
+		cleanup, revertErr = o.revertAtTTL(ctx, exp, cleanup, ttl)
 		if revertErr != nil {
 			result.Phase = v1alpha1.PhaseAborted
-			result.Error = "experiment interrupted: context cancelled during observation"
+			result.Error = fmt.Sprintf("experiment aborted during fault revert: %v", revertErr)
 			return result, revertErr
 		}
 		o.logger.Info("fault reverted at TTL, observing recovery window", "recoveryTimeout", recoveryTimeout)

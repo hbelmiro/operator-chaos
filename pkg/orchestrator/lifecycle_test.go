@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1434,4 +1435,85 @@ func TestRunLeaseDurationIncludesTTL(t *testing.T) {
 	_, err = orch2.Run(context.Background(), exp2)
 	require.NoError(t, err)
 	assert.Equal(t, 2*60*time.Millisecond, lock2.acquiredWith)
+}
+
+// renewRecordingLock records Renew calls and can fail them.
+type renewRecordingLock struct {
+	safety.ExperimentLock
+	renewCount   int
+	renewErr     error
+	acquireErr   error
+	acquiredWith time.Duration
+}
+
+func (d *renewRecordingLock) Acquire(_ context.Context, _ string, _ string, leaseDuration time.Duration) error {
+	if d.acquireErr != nil {
+		return d.acquireErr
+	}
+	d.acquiredWith = leaseDuration
+	return nil
+}
+
+func (d *renewRecordingLock) Renew(_ context.Context, _ string, _ string) error {
+	d.renewCount++
+	return d.renewErr
+}
+
+func newRenewTestOrchestrator(lock *renewRecordingLock, inj *mockInjector) *Orchestrator {
+	registry := injection.NewRegistry()
+	registry.Register(v1alpha1.PodKill, inj)
+	return New(OrchestratorConfig{
+		Registry:  registry,
+		Observer:  &timelineObserver{},
+		Evaluator: evaluator.New(10),
+		Lock:      lock,
+		Verbose:   false,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+}
+
+// TestRunRenewsLeaseDuringCleanupRetries verifies the lease is renewed while
+// fault cleanup keeps failing: the retry loop can outlast the fixed lease
+// duration, and without renewal another experiment could lock the same
+// operator while this fault is still active.
+func TestRunRenewsLeaseDuringCleanupRetries(t *testing.T) {
+	inj := &mockInjector{}
+	attempts := 0
+	inj.cleanupFunc = func(_ context.Context) error {
+		attempts++
+		if attempts <= 2 {
+			return fmt.Errorf("transient revert failure")
+		}
+		return nil
+	}
+	lock := &renewRecordingLock{ExperimentLock: safety.NewLocalExperimentLock()}
+	orch := newRenewTestOrchestrator(lock, inj)
+	orch.revertRetryInterval = time.Millisecond
+
+	exp := newTimelineExperiment(20*time.Millisecond, 60*time.Millisecond)
+	_, err := orch.Run(context.Background(), exp)
+	require.NoError(t, err)
+	assert.Equal(t, 3, attempts)
+	assert.GreaterOrEqual(t, lock.renewCount, 2, "lease must be renewed on each cleanup retry")
+}
+
+// TestRunAbortsWhenLeaseLostDuringCleanupRetry verifies that a failed lease
+// renewal mid-retry aborts the run instead of continuing to hold a lost lock.
+func TestRunAbortsWhenLeaseLostDuringCleanupRetry(t *testing.T) {
+	inj := &mockInjector{}
+	cleanupCalled := false
+	inj.cleanupFunc = func(_ context.Context) error {
+		cleanupCalled = true
+		return fmt.Errorf("transient revert failure")
+	}
+	lock := &renewRecordingLock{ExperimentLock: safety.NewLocalExperimentLock(), renewErr: errors.New("lease expired")}
+	orch := newRenewTestOrchestrator(lock, inj)
+	orch.revertRetryInterval = time.Millisecond
+
+	exp := newTimelineExperiment(20*time.Millisecond, 60*time.Millisecond)
+	result, err := orch.Run(context.Background(), exp)
+	require.Error(t, err)
+	assert.Equal(t, v1alpha1.PhaseAborted, result.Phase)
+	assert.True(t, cleanupCalled)
+	assert.Contains(t, err.Error(), "lock renewal")
 }
