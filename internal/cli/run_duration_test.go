@@ -31,7 +31,7 @@ func TestValidateRunDuration_RejectsExceedingDuration(t *testing.T) {
 	exp := newDurationTestExperiment(2*time.Minute, 3*time.Minute)
 	err := validateRunDuration(exp, 4*time.Minute)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "5m0s")
+	assert.Contains(t, err.Error(), "8m0s")
 	assert.Contains(t, err.Error(), "--timeout")
 }
 
@@ -54,6 +54,19 @@ func TestValidateRunDuration_NoTTLUsesRecoveryTimeout(t *testing.T) {
 func TestValidateRunDuration_ExactFitRejected(t *testing.T) {
 	exp := newDurationTestExperiment(2*time.Minute, 3*time.Minute)
 	err := validateRunDuration(exp, 5*time.Minute)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds --timeout")
+}
+
+// TestValidateRunDuration_ReservesPostCheckBudget verifies the guard reserves
+// time for the post-check's reconciliation poll, which gets up to another
+// full recoveryTimeout on the same context after the recovery window: a run
+// whose TTL plus one recoveryTimeout fits the timeout but whose worst-case
+// total (TTL + 2x recoveryTimeout) does not must be rejected, or a slow
+// operator's Degraded verdict is lost to a context abort mid-poll.
+func TestValidateRunDuration_ReservesPostCheckBudget(t *testing.T) {
+	exp := newDurationTestExperiment(2*time.Minute, 3*time.Minute)
+	err := validateRunDuration(exp, 7*time.Minute)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exceeds --timeout")
 }

@@ -1494,7 +1494,8 @@ func TestRunRenewsLeaseDuringCleanupRetries(t *testing.T) {
 	_, err := orch.Run(context.Background(), exp)
 	require.NoError(t, err)
 	assert.Equal(t, 3, attempts)
-	assert.GreaterOrEqual(t, lock.renewCount, 2, "lease must be renewed on each cleanup retry")
+	assert.Equal(t, 3, lock.renewCount,
+		"lease must be renewed on each cleanup retry and once more after the successful revert, so the recovery window and post-check fit in a fresh lease")
 }
 
 // TestRunAbortsWhenLeaseLostDuringCleanupRetry verifies that a failed lease

@@ -353,6 +353,14 @@ func (o *Orchestrator) revertAtTTL(ctx context.Context, exp *v1alpha1.ChaosExper
 		cleanErr := cleanup(cleanupCtx)
 		cleanupCancel()
 		if cleanErr == nil {
+			// Fault reverted. Renew once more so the recovery window and
+			// the post-check fit inside a fresh lease; the earlier renewal
+			// only bought the retry loop time. The fault is already gone,
+			// so a failed renewal here is not worth aborting over — the
+			// rest of the run is observation-only.
+			if err := o.lock.Renew(ctx, exp.Spec.Target.Operator, exp.Name); err != nil {
+				o.logger.Warn("experiment lock renewal failed after fault revert", "error", err)
+			}
 			// Consumed: the deferred cleanup must not run a second time.
 			return nil, nil
 		}
